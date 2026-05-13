@@ -71,28 +71,39 @@ interface NotifyConfig {
 	title: string;
 }
 
-const CONFIG: NotifyConfig = {
-	enabled: true,
-	minIntervalMs: 30_000,
-	maxPerSession: 20,
-	enableFocusCheck: true,
-	title: "OMP",
-};
+function loadConfig(): NotifyConfig {
+	return {
+		enabled: process.env.OMP_NOTIFY_ENABLED !== "false",
+		minIntervalMs: parseInt(process.env.OMP_NOTIFY_MIN_INTERVAL || "30000", 10),
+		maxPerSession: parseInt(process.env.OMP_NOTIFY_MAX_PER_SESSION || "20", 10),
+		enableFocusCheck: process.env.OMP_NOTIFY_FOCUS_CHECK !== "false",
+		title: process.env.OMP_NOTIFY_TITLE || "OMP",
+	};
+}
+
+
+
+const CONFIG: NotifyConfig = loadConfig();
 
 // ============================================================================
 // State
 // ============================================================================
 
+
 interface NotifyState {
 	lastNotifyTime: number;
 	notifyCount: number;
-	sessionFile: string;
+	retryTimer: ReturnType<typeof setTimeout> | null;
+	lastSummary: string;
+	lastSummaryTime: number;
 }
 
 const state: NotifyState = {
 	lastNotifyTime: 0,
 	notifyCount: 0,
-	sessionFile: "",
+	retryTimer: null,
+	lastSummary: "",
+	lastSummaryTime: 0,
 };
 
 // ============================================================================
@@ -100,7 +111,9 @@ const state: NotifyState = {
 // ============================================================================
 
 function generateSummary(event: TurnEndEvent): string {
-	const { toolResults, message } = event;
+
+	const toolResults = event.toolResults || [];
+	const message = event.message || { role: "assistant", content: [] };
 
 	const totalTools = toolResults.length;
 	const errorTools = toolResults.filter((t) => t.isError).length;
@@ -171,10 +184,11 @@ public class WinFocus {
 }
 "@
 
-function Get-AncestorPids([int]$pid) {
-    $ancestors = @($pid)
-    $current = $pid
-    $visited = @($pid)
+
+function Get-AncestorPids([int]$TargetPid) {
+	$ancestors = @($TargetPid)
+	$current = $TargetPid
+	$visited = @($TargetPid)
     while ($true) {
         try {
             $proc = Get-Process -Id $current -ErrorAction SilentlyContinue
@@ -225,7 +239,9 @@ async function sendWindowsNotification(
 			.replace(/</g, "&lt;")
 			.replace(/>/g, "&gt;")
 			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&apos;");
+
+			.replace(/'/g, "&apos;")
+			.replace(/\r?\n/g, " ");
 	}
 
 	const safeTitle = xmlEscape(title);
@@ -245,13 +261,10 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("OMP").Show($toast)
 `.trim();
 
-	try {
-		await pi.exec("powershell", ["-NoProfile", "-Command", script], {
-			timeout: 10000,
-		});
-	} catch (err) {
-		pi.logger.warn(`[omp-notify] Toast notification failed: ${err}`);
-	}
+
+	await pi.exec("powershell", ["-NoProfile", "-Command", script], {
+		timeout: 10000,
+	});
 }
 
 // ============================================================================
@@ -280,6 +293,7 @@ export default function ompNotify(pi: ExtensionAPI) {
 		return true;
 	}
 
+
 	async function maybeNotify(
 		title: string,
 		body: string,
@@ -287,6 +301,13 @@ export default function ompNotify(pi: ExtensionAPI) {
 	): Promise<{ sent: boolean; reason?: string }> {
 		if (!shouldNotify(options?.bypassThrottle)) {
 			return { sent: false, reason: "throttle" };
+		}
+
+		// Deduplicate: skip if same summary within 10s
+		const now = Date.now();
+		if (body === state.lastSummary && now - state.lastSummaryTime < 10_000) {
+			pi.logger.debug("[omp-notify] Duplicate summary, skipping");
+			return { sent: false, reason: "duplicate" };
 		}
 
 		if (CONFIG.enableFocusCheck) {
@@ -302,26 +323,43 @@ export default function ompNotify(pi: ExtensionAPI) {
 			}
 		}
 
+		// Optimistic state update
+		const prevTime = state.lastNotifyTime;
+		const prevCount = state.notifyCount;
+		state.lastNotifyTime = now;
+		state.notifyCount++;
+		state.lastSummary = body;
+		state.lastSummaryTime = now;
+
 		try {
 			await sendWindowsNotification(pi, title, body);
 		} catch (err) {
-			pi.logger.warn(`[omp-notify] sendWindowsNotification failed: ${err}`);
+			// Rollback on failure
+			state.lastNotifyTime = prevTime;
+			state.notifyCount = prevCount;
+			state.lastSummary = "";
+			state.lastSummaryTime = 0;
+			pi.logger.warn(`[omp-notify] Toast notification failed (API may be unavailable): ${err}`);
 			return { sent: false, reason: "send_failed" };
 		}
 
-		state.lastNotifyTime = Date.now();
-		state.notifyCount++;
 		pi.logger.info(
 			`[omp-notify] Notification sent (${state.notifyCount}/${CONFIG.maxPerSession})`,
 		);
 		return { sent: true };
 	}
 	// Reset state on session start
-	pi.on("session_start", async (_event, ctx) => {
-		state.sessionFile = ctx.sessionManager.getSessionFile() || "";
+
+	pi.on("session_start", async () => {
+		if (state.retryTimer) {
+			clearTimeout(state.retryTimer);
+			state.retryTimer = null;
+		}
 		state.notifyCount = 0;
 		state.lastNotifyTime = 0;
-		pi.logger.info(`[omp-notify] Session started: ${state.sessionFile || "<new>"}`);
+		state.lastSummary = "";
+		state.lastSummaryTime = 0;
+		pi.logger.info("[omp-notify] Session started, state reset");
 	});
 
 	// Main trigger: turn ended
@@ -335,11 +373,13 @@ export default function ompNotify(pi: ExtensionAPI) {
 		pi.logger.info("[omp-notify] agent_end event received");
 		const summary = generateAgentEndSummary();
 		const result = await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+
 		if (!result.sent && result.reason === "focused") {
 			pi.logger.info("[omp-notify] Retrying notification in 5s after focus check");
-			setTimeout(async () => {
+			state.retryTimer = setTimeout(async () => {
 				pi.logger.info("[omp-notify] Retry notification after delay");
 				await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+				state.retryTimer = null;
 			}, 5000);
 		}
 	});
