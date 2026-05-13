@@ -196,7 +196,7 @@ $myAncestors = Get-AncestorPids $myPid
 $fgAncestors = Get-AncestorPids $fgPid
 
 $intersection = $myAncestors | Where-Object { $fgAncestors -contains $_ }
-$intersection.Count -gt 0
+($intersection | Measure-Object).Count -gt 0
 `.trim();
 
 	try {
@@ -284,30 +284,38 @@ export default function ompNotify(pi: ExtensionAPI) {
 		title: string,
 		body: string,
 		options?: { bypassThrottle?: boolean },
-	): Promise<void> {
-		if (!shouldNotify(options?.bypassThrottle)) return;
+	): Promise<{ sent: boolean; reason?: string }> {
+		if (!shouldNotify(options?.bypassThrottle)) {
+			return { sent: false, reason: "throttle" };
+		}
 
 		if (CONFIG.enableFocusCheck) {
 			try {
 				const focused = await isWindowFocused(pi);
 				if (focused) {
-					pi.logger.debug("[omp-notify] Window is focused, skipping notification");
-					return;
+					pi.logger.info("[omp-notify] Window is focused, skipping notification");
+					return { sent: false, reason: "focused" };
 				}
-			} catch {
+			} catch (err) {
+				pi.logger.warn(`[omp-notify] Focus check failed: ${err}`);
 				// Continue to notify on focus check failure
 			}
 		}
 
-		await sendWindowsNotification(pi, title, body);
+		try {
+			await sendWindowsNotification(pi, title, body);
+		} catch (err) {
+			pi.logger.warn(`[omp-notify] sendWindowsNotification failed: ${err}`);
+			return { sent: false, reason: "send_failed" };
+		}
 
 		state.lastNotifyTime = Date.now();
 		state.notifyCount++;
 		pi.logger.info(
 			`[omp-notify] Notification sent (${state.notifyCount}/${CONFIG.maxPerSession})`,
 		);
+		return { sent: true };
 	}
-
 	// Reset state on session start
 	pi.on("session_start", async (_event, ctx) => {
 		state.sessionFile = ctx.sessionManager.getSessionFile() || "";
@@ -326,8 +334,14 @@ export default function ompNotify(pi: ExtensionAPI) {
 	pi.on("agent_end", async (_event) => {
 		pi.logger.info("[omp-notify] agent_end event received");
 		const summary = generateAgentEndSummary();
-		await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+		const result = await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+		if (!result.sent && result.reason === "focused") {
+			pi.logger.info("[omp-notify] Retrying notification in 5s after focus check");
+			setTimeout(async () => {
+				pi.logger.info("[omp-notify] Retry notification after delay");
+				await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+			}, 5000);
+		}
 	});
-
 	pi.logger.info("[omp-notify] Extension loaded");
 }
