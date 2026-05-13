@@ -59,6 +59,10 @@ interface AgentEndEvent {
 	messages: unknown[];
 }
 
+interface SessionShutdownEvent {
+	type: "session_shutdown";
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -68,6 +72,7 @@ interface NotifyConfig {
 	minIntervalMs: number;
 	maxPerSession: number;
 	enableFocusCheck: boolean;
+	focusCheckStrict: boolean;
 	title: string;
 }
 
@@ -77,10 +82,10 @@ function loadConfig(): NotifyConfig {
 		minIntervalMs: parseInt(process.env.OMP_NOTIFY_MIN_INTERVAL || "30000", 10),
 		maxPerSession: parseInt(process.env.OMP_NOTIFY_MAX_PER_SESSION || "20", 10),
 		enableFocusCheck: process.env.OMP_NOTIFY_FOCUS_CHECK !== "false",
+		focusCheckStrict: process.env.OMP_NOTIFY_FOCUS_CHECK_STRICT === "true",
 		title: process.env.OMP_NOTIFY_TITLE || "OMP",
 	};
 }
-
 
 
 const CONFIG: NotifyConfig = loadConfig();
@@ -89,13 +94,17 @@ const CONFIG: NotifyConfig = loadConfig();
 // State
 // ============================================================================
 
-
 interface NotifyState {
 	lastNotifyTime: number;
 	notifyCount: number;
 	retryTimer: ReturnType<typeof setTimeout> | null;
 	lastSummary: string;
 	lastSummaryTime: number;
+	lastTurnSummary: string;
+	lastTurnSummaryTime: number;
+	lastEndSummary: string;
+	lastEndSummaryTime: number;
+	isNotifying: boolean;
 }
 
 const state: NotifyState = {
@@ -104,6 +113,11 @@ const state: NotifyState = {
 	retryTimer: null,
 	lastSummary: "",
 	lastSummaryTime: 0,
+	lastTurnSummary: "",
+	lastTurnSummaryTime: 0,
+	lastEndSummary: "",
+	lastEndSummaryTime: 0,
+	isNotifying: false,
 };
 
 // ============================================================================
@@ -157,14 +171,19 @@ function generateAgentEndSummary(): string {
 	return "所有任务已完成，等待你的输入";
 }
 
+function generateSessionShutdownSummary(): string {
+	return "OMP 会话已结束";
+}
+
 // ============================================================================
 // Windows Focus Detection
 // ============================================================================
 
-async function isWindowFocused(pi: ExtensionAPI): Promise<boolean> {
+async function isWindowFocused(pi: ExtensionAPI, strict: boolean): Promise<boolean> {
 	const myPid = process.pid;
 
-	const script = `
+	const script = strict
+		? `
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -184,6 +203,29 @@ public class WinFocus {
 }
 "@
 
+$fgPid = [int][WinFocus]::GetForegroundPid()
+$myPid = ${myPid}
+$fgPid -eq $myPid
+`.trim()
+		: `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinFocus {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    public static uint GetForegroundPid() {
+        IntPtr hwnd = GetForegroundWindow();
+        uint pid = 0;
+        GetWindowThreadProcessId(hwnd, out pid);
+        return pid;
+    }
+}
+"@
 
 function Get-AncestorPids([int]$TargetPid) {
 	$ancestors = @($TargetPid)
@@ -276,17 +318,17 @@ export default function ompNotify(pi: ExtensionAPI) {
 
 	function shouldNotify(bypassThrottle = false): boolean {
 		if (!CONFIG.enabled) {
-			pi.logger.debug("[omp-notify] Disabled, skipping");
+			pi.logger.info("[omp-notify] Disabled, skipping");
 			return false;
 		}
 		if (state.notifyCount >= CONFIG.maxPerSession) {
-			pi.logger.debug("[omp-notify] Max notifications reached for this session");
+			pi.logger.info("[omp-notify] Max notifications reached for this session");
 			return false;
 		}
 		if (!bypassThrottle) {
 			const now = Date.now();
 			if (now - state.lastNotifyTime < CONFIG.minIntervalMs) {
-				pi.logger.debug("[omp-notify] Too soon since last notification");
+				pi.logger.info("[omp-notify] Too soon since last notification");
 				return false;
 			}
 		}
@@ -297,56 +339,88 @@ export default function ompNotify(pi: ExtensionAPI) {
 	async function maybeNotify(
 		title: string,
 		body: string,
-		options?: { bypassThrottle?: boolean },
+		options?: { bypassThrottle?: boolean; dedupType?: "turn" | "end" },
 	): Promise<{ sent: boolean; reason?: string }> {
+		if (state.isNotifying) {
+			pi.logger.info("[omp-notify] Notification already in progress, skipping");
+			return { sent: false, reason: "busy" };
+		}
+
 		if (!shouldNotify(options?.bypassThrottle)) {
 			return { sent: false, reason: "throttle" };
 		}
 
-		// Deduplicate: skip if same summary within 10s
-		const now = Date.now();
-		if (body === state.lastSummary && now - state.lastSummaryTime < 10_000) {
-			pi.logger.debug("[omp-notify] Duplicate summary, skipping");
-			return { sent: false, reason: "duplicate" };
-		}
-
-		if (CONFIG.enableFocusCheck) {
-			try {
-				const focused = await isWindowFocused(pi);
-				if (focused) {
-					pi.logger.info("[omp-notify] Window is focused, skipping notification");
-					return { sent: false, reason: "focused" };
-				}
-			} catch (err) {
-				pi.logger.warn(`[omp-notify] Focus check failed: ${err}`);
-				// Continue to notify on focus check failure
-			}
-		}
-
-		// Optimistic state update
-		const prevTime = state.lastNotifyTime;
-		const prevCount = state.notifyCount;
-		state.lastNotifyTime = now;
-		state.notifyCount++;
-		state.lastSummary = body;
-		state.lastSummaryTime = now;
-
+		state.isNotifying = true;
 		try {
-			await sendWindowsNotification(pi, title, body);
-		} catch (err) {
-			// Rollback on failure
-			state.lastNotifyTime = prevTime;
-			state.notifyCount = prevCount;
-			state.lastSummary = "";
-			state.lastSummaryTime = 0;
-			pi.logger.warn(`[omp-notify] Toast notification failed (API may be unavailable): ${err}`);
-			return { sent: false, reason: "send_failed" };
-		}
+			// Deduplicate: skip if same summary within 10s
+			const now = Date.now();
+			const dedupType = options?.dedupType ?? "turn";
+			if (dedupType === "turn") {
+				if (body === state.lastTurnSummary && now - state.lastTurnSummaryTime < 10_000) {
+					pi.logger.info("[omp-notify] Duplicate turn summary, skipping");
+					return { sent: false, reason: "duplicate" };
+				}
+			} else {
+				if (body === state.lastEndSummary && now - state.lastEndSummaryTime < 10_000) {
+					pi.logger.info("[omp-notify] Duplicate end summary, skipping");
+					return { sent: false, reason: "duplicate" };
+				}
+			}
 
-		pi.logger.info(
-			`[omp-notify] Notification sent (${state.notifyCount}/${CONFIG.maxPerSession})`,
-		);
-		return { sent: true };
+			if (CONFIG.enableFocusCheck) {
+				try {
+					const focused = await isWindowFocused(pi, CONFIG.focusCheckStrict);
+					if (focused) {
+						pi.logger.info("[omp-notify] Window is focused, skipping notification");
+						return { sent: false, reason: "focused" };
+					}
+				} catch (err) {
+					pi.logger.warn(`[omp-notify] Focus check failed: ${err}`);
+					// Continue to notify on focus check failure
+				}
+			}
+
+			// Optimistic state update
+			const prevTime = state.lastNotifyTime;
+			const prevCount = state.notifyCount;
+			state.lastNotifyTime = now;
+			state.notifyCount++;
+			state.lastSummary = body;
+			state.lastSummaryTime = now;
+			if (dedupType === "turn") {
+				state.lastTurnSummary = body;
+				state.lastTurnSummaryTime = now;
+			} else {
+				state.lastEndSummary = body;
+				state.lastEndSummaryTime = now;
+			}
+
+			try {
+				await sendWindowsNotification(pi, title, body);
+			} catch (err) {
+				// Rollback on failure
+				state.lastNotifyTime = prevTime;
+				state.notifyCount = prevCount;
+				state.lastSummary = "";
+				state.lastSummaryTime = 0;
+				if (dedupType === "turn") {
+					state.lastTurnSummary = "";
+					state.lastTurnSummaryTime = 0;
+				} else {
+					state.lastEndSummary = "";
+					state.lastEndSummaryTime = 0;
+				}
+				pi.logger.warn(`[omp-notify] Toast notification failed (API may be unavailable): ${err}`);
+				return { sent: false, reason: "send_failed" };
+			}
+
+			pi.logger.info(
+				`[omp-notify] Notification sent (${state.notifyCount}/${CONFIG.maxPerSession})`,
+			);
+			return { sent: true };
+		} finally {
+			state.isNotifying = false;
+		}
 	}
 	// Reset state on session start
 
@@ -359,29 +433,51 @@ export default function ompNotify(pi: ExtensionAPI) {
 		state.lastNotifyTime = 0;
 		state.lastSummary = "";
 		state.lastSummaryTime = 0;
+		state.lastTurnSummary = "";
+		state.lastTurnSummaryTime = 0;
+		state.lastEndSummary = "";
+		state.lastEndSummaryTime = 0;
+		state.isNotifying = false;
 		pi.logger.info("[omp-notify] Session started, state reset");
 	});
 
 	// Main trigger: turn ended
 	pi.on("turn_end", async (event) => {
 		const summary = generateSummary(event as TurnEndEvent);
-		await maybeNotify(CONFIG.title, summary);
+		await maybeNotify(CONFIG.title, summary, { dedupType: "turn" });
 	});
 
 	// Fallback trigger: agent ended
 	pi.on("agent_end", async (_event) => {
 		pi.logger.info("[omp-notify] agent_end event received");
 		const summary = generateAgentEndSummary();
-		const result = await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+		const result = await maybeNotify(CONFIG.title, summary, { bypassThrottle: true, dedupType: "end" });
 
-		if (!result.sent && result.reason === "focused") {
-			pi.logger.info("[omp-notify] Retrying notification in 5s after focus check");
+		if (!result.sent && (result.reason === "focused" || result.reason === "send_failed")) {
+			pi.logger.info("[omp-notify] Retrying notification in 5s after " + result.reason);
 			state.retryTimer = setTimeout(async () => {
 				pi.logger.info("[omp-notify] Retry notification after delay");
-				await maybeNotify(CONFIG.title, summary, { bypassThrottle: true });
+				await maybeNotify(CONFIG.title, summary, { bypassThrottle: true, dedupType: "end" });
 				state.retryTimer = null;
 			}, 5000);
 		}
 	});
+
+	// Session shutdown trigger
+	pi.on("session_shutdown", async (_event) => {
+		pi.logger.info("[omp-notify] session_shutdown event received");
+		const summary = generateSessionShutdownSummary();
+		const result = await maybeNotify(CONFIG.title, summary, { bypassThrottle: true, dedupType: "end" });
+
+		if (!result.sent && (result.reason === "focused" || result.reason === "send_failed")) {
+			pi.logger.info("[omp-notify] Retrying notification in 5s after " + result.reason);
+			state.retryTimer = setTimeout(async () => {
+				pi.logger.info("[omp-notify] Retry notification after delay");
+				await maybeNotify(CONFIG.title, summary, { bypassThrottle: true, dedupType: "end" });
+				state.retryTimer = null;
+			}, 5000);
+		}
+	});
+
 	pi.logger.info("[omp-notify] Extension loaded");
 }
