@@ -1,0 +1,13 @@
+{
+  "name": "omp-notify",
+  "version": "1.0.0",
+  "description": "Windows system notifications for OMP when tasks complete",
+  "main": "src/index.ts",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "latest",
+    "typescript": "^5.4.0"
+  }
+}
